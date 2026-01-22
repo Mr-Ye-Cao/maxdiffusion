@@ -861,6 +861,16 @@ class AttentionOp(nn.Module):
 
 
 class FlaxWanAttention(nnx.Module):
+  """Wan attention with optional DistriFusion support.
+
+  DistriFusion for self-attention:
+  - All-gather K, V from all fsdp shards before attention
+  - After warmup_steps: use stale K, V from previous timestep
+  - Local Q attends to full K, V
+
+  DistriFusion for cross-attention:
+  - Cache text K, V (doesn't change across timesteps)
+  """
 
   def __init__(
       self,
@@ -893,6 +903,10 @@ class FlaxWanAttention(nnx.Module):
       enable_jax_named_scopes: bool = False,
       added_kv_proj_dim: Optional[int] = None,  # New for I2V
       image_seq_len: Optional[int] = None,  # New for I2V
+      # DistriFusion parameters
+      distrifusion_enabled: bool = False,
+      distrifusion_warmup_steps: int = 2,
+      distrifusion_axis_name: str = "fsdp",
   ):
     if attention_kernel == "cudnn_flash_te":
       raise NotImplementedError(f"Wan 2.1 has not been tested with {attention_kernel}")
@@ -918,6 +932,24 @@ class FlaxWanAttention(nnx.Module):
       axis_names_kv = (BATCH, CROSS_ATTN_HEAD, CROSS_ATTN_KV_LENGTH, D_KV)
     self.added_kv_proj_dim = added_kv_proj_dim  # New for I2V
     self.image_seq_len = image_seq_len  # New for I2V
+
+    # DistriFusion config
+    self.distrifusion_enabled = distrifusion_enabled
+    self.distrifusion_warmup_steps = distrifusion_warmup_steps
+    self.distrifusion_axis_name = distrifusion_axis_name
+    self.is_self_attention = is_self_attention
+
+    # DistriFusion state (for KV buffer and counter)
+    # These are used for stale KV reuse and text KV caching
+    # k_buffer, v_buffer: for self-attention stale KV
+    # cross_k_cache, cross_v_cache: for cross-attention text KV caching
+    # counter: timestep counter for warmup logic
+    if distrifusion_enabled:
+      self.df_k_buffer = nnx.Variable(None)
+      self.df_v_buffer = nnx.Variable(None)
+      self.df_cross_k_cache = nnx.Variable(None)
+      self.df_cross_v_cache = nnx.Variable(None)
+      self.df_counter = nnx.Variable(0)
 
     self.attention_op = NNXAttentionOp(
         mesh=mesh,
@@ -1068,6 +1100,43 @@ class FlaxWanAttention(nnx.Module):
           ),
       )
 
+  def distrifusion_reset(self):
+    """Reset DistriFusion state for new generation."""
+    if self.distrifusion_enabled:
+      self.df_k_buffer.value = None
+      self.df_v_buffer.value = None
+      self.df_cross_k_cache.value = None
+      self.df_cross_v_cache.value = None
+      self.df_counter.value = 0
+
+  def _distrifusion_gather_kv(
+      self,
+      key_proj: jax.Array,
+      value_proj: jax.Array,
+  ) -> Tuple[jax.Array, jax.Array]:
+    """All-gather K, V from all fsdp shards for DistriFusion.
+
+    Args:
+        key_proj: Local K [batch, local_seq_len, dim] or [batch, heads, local_seq_len, head_dim]
+        value_proj: Local V, same shape as key_proj
+
+    Returns:
+        (key_full, value_full): Gathered K, V with full sequence length
+    """
+    axis_name = self.distrifusion_axis_name
+
+    # all_gather on sequence dimension (axis=1 for [B, S, D] or axis=2 for [B, H, S, D])
+    if key_proj.ndim == 3:
+      # Shape: [batch, seq, dim]
+      key_full = jax.lax.all_gather(key_proj, axis_name=axis_name, axis=1, tiled=True)
+      value_full = jax.lax.all_gather(value_proj, axis_name=axis_name, axis=1, tiled=True)
+    else:
+      # Shape: [batch, heads, seq, head_dim]
+      key_full = jax.lax.all_gather(key_proj, axis_name=axis_name, axis=2, tiled=True)
+      value_full = jax.lax.all_gather(value_proj, axis_name=axis_name, axis=2, tiled=True)
+
+    return key_full, value_full
+
   def _apply_rope(self, xq: jax.Array, xk: jax.Array, freqs_cis: jax.Array) -> Tuple[jax.Array, jax.Array]:
     dtype = xq.dtype
     reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
@@ -1120,6 +1189,19 @@ class FlaxWanAttention(nnx.Module):
         with self.conditional_named_scope("attn_k_norm"):
           key_proj = self.norm_k(key_proj)
 
+      # DistriFusion: cache text K, V for cross-attention
+      # Text embeddings don't change across timesteps, so we cache K, V after first computation
+      if self.distrifusion_enabled and not is_self_attention:
+        with self.conditional_named_scope("distrifusion_cross_kv_cache"):
+          if self.df_cross_k_cache.value is None:
+            # First timestep: compute and cache
+            self.df_cross_k_cache.value = key_proj
+            self.df_cross_v_cache.value = value_proj
+          else:
+            # Subsequent timesteps: use cached K, V
+            key_proj = self.df_cross_k_cache.value
+            value_proj = self.df_cross_v_cache.value
+
       if rotary_emb is not None:
         with self.conditional_named_scope("attn_rope"):
           query_proj = _unflatten_heads(query_proj, self.heads)
@@ -1127,6 +1209,38 @@ class FlaxWanAttention(nnx.Module):
           value_proj = _unflatten_heads(value_proj, self.heads)
           # output of _unflatten_heads Batch, heads, seq_len, head_dim
           query_proj, key_proj = self._apply_rope(query_proj, key_proj, rotary_emb)
+
+      # DistriFusion: all-gather K, V for self-attention
+      # Each device has local K, V; gather to get full sequence K, V
+      # Local Q attends to full K, V
+      if self.distrifusion_enabled and is_self_attention:
+        with self.conditional_named_scope("distrifusion_gather_kv"):
+          # Check if we should use stale KV (after warmup steps)
+          use_stale = self.df_counter.value >= self.distrifusion_warmup_steps
+
+          if not use_stale:
+            # Warmup: synchronous all-gather, then update buffer
+            key_proj, value_proj = self._distrifusion_gather_kv(key_proj, value_proj)
+            # Save to buffer for next timestep
+            self.df_k_buffer.value = key_proj
+            self.df_v_buffer.value = value_proj
+          else:
+            # After warmup: use stale KV from previous timestep
+            # Then start async update (for overlap, user implements async version)
+            key_proj_stale = self.df_k_buffer.value
+            value_proj_stale = self.df_v_buffer.value
+
+            # Update buffer with current gathered KV for next timestep
+            key_proj_new, value_proj_new = self._distrifusion_gather_kv(key_proj, value_proj)
+            self.df_k_buffer.value = key_proj_new
+            self.df_v_buffer.value = value_proj_new
+
+            # Use stale KV for this timestep's attention
+            key_proj = key_proj_stale
+            value_proj = value_proj_stale
+
+          # Increment counter
+          self.df_counter.value = self.df_counter.value + 1
 
       query_proj = checkpoint_name(query_proj, "query_proj")
       key_proj = checkpoint_name(key_proj, "key_proj")

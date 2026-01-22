@@ -291,6 +291,10 @@ class WanTransformerBlock(nnx.Module):
       dropout: float = 0.0,
       mask_padding_tokens: bool = True,
       enable_jax_named_scopes: bool = False,
+      # DistriFusion parameters
+      distrifusion_enabled: bool = False,
+      distrifusion_warmup_steps: int = 2,
+      distrifusion_axis_name: str = "fsdp",
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
 
@@ -315,9 +319,12 @@ class WanTransformerBlock(nnx.Module):
         mask_padding_tokens=mask_padding_tokens,
         residual_checkpoint_name="self_attn",
         enable_jax_named_scopes=enable_jax_named_scopes,
+        distrifusion_enabled=distrifusion_enabled,
+        distrifusion_warmup_steps=distrifusion_warmup_steps,
+        distrifusion_axis_name=distrifusion_axis_name,
     )
 
-    # 1. Cross-attention
+    # 2. Cross-attention
     self.attn2 = FlaxWanAttention(
         rngs=rngs,
         query_dim=dim,
@@ -339,6 +346,9 @@ class WanTransformerBlock(nnx.Module):
         mask_padding_tokens=mask_padding_tokens,
         residual_checkpoint_name="cross_attn",
         enable_jax_named_scopes=enable_jax_named_scopes,
+        distrifusion_enabled=distrifusion_enabled,
+        distrifusion_warmup_steps=distrifusion_warmup_steps,
+        distrifusion_axis_name=distrifusion_axis_name,
     )
     assert cross_attn_norm is True
     self.norm2 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=True)
@@ -365,6 +375,11 @@ class WanTransformerBlock(nnx.Module):
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
+
+  def distrifusion_reset(self):
+    """Reset DistriFusion state for new generation."""
+    self.attn1.distrifusion_reset()
+    self.attn2.distrifusion_reset()
 
   def __call__(
       self,
@@ -469,6 +484,10 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       mask_padding_tokens: bool = True,
       scan_layers: bool = True,
       enable_jax_named_scopes: bool = False,
+      # DistriFusion parameters
+      distrifusion_enabled: bool = False,
+      distrifusion_warmup_steps: int = 2,
+      distrifusion_axis_name: str = "fsdp",
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
@@ -506,6 +525,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
         flash_min_seq_length=flash_min_seq_length,
     )
 
+    # Store DistriFusion config for reset
+    self.distrifusion_enabled = distrifusion_enabled
+
     # 3. Transformer blocks
     @nnx.split_rngs(splits=num_layers)
     @nnx.vmap(in_axes=0, out_axes=0, transform_metadata={nnx.PARTITION_NAME: "layers_per_stage"})
@@ -530,6 +552,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
           enable_jax_named_scopes=enable_jax_named_scopes,
           added_kv_proj_dim=added_kv_proj_dim,
           image_seq_len=image_seq_len,
+          distrifusion_enabled=distrifusion_enabled,
+          distrifusion_warmup_steps=distrifusion_warmup_steps,
+          distrifusion_axis_name=distrifusion_axis_name,
       )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(remat_policy)
@@ -557,7 +582,12 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             weights_dtype=weights_dtype,
             precision=precision,
             attention=attention,
+            dropout=dropout,
+            mask_padding_tokens=mask_padding_tokens,
             enable_jax_named_scopes=enable_jax_named_scopes,
+            distrifusion_enabled=distrifusion_enabled,
+            distrifusion_warmup_steps=distrifusion_warmup_steps,
+            distrifusion_axis_name=distrifusion_axis_name,
         )
         blocks.append(block)
       self.blocks = blocks
@@ -581,6 +611,26 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
+
+  def distrifusion_reset(self):
+    """Reset DistriFusion state for new generation.
+
+    Call this at the start of each new video generation to reset:
+    - KV buffers for self-attention
+    - Text KV cache for cross-attention
+    - Timestep counters
+    """
+    if not self.distrifusion_enabled:
+      return
+
+    if self.scan_layers:
+      # For scan layers, the blocks are vmapped so we need to call reset differently
+      # This is a limitation - scan layers with DistriFusion state needs special handling
+      # For now, we iterate if possible (requires nnx.scan unroll or manual handling)
+      pass  # TODO: Handle scan_layers case properly
+    else:
+      for block in self.blocks:
+        block.distrifusion_reset()
 
   @jax.named_scope("WanModel")
   def __call__(
